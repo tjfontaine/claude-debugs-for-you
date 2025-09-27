@@ -387,7 +387,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             case 'getFileContent':
                 return await this.handleGetFile(request.arguments);
             case 'debug':
-                return await this.handleDebug(request.arguments);
+                return await this.executeDebugPlan(request.arguments);
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -515,126 +515,6 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         const doc = await vscode.workspace.openTextDocument(payload.path);
         const lines = doc.getText().split('\n');
         return lines.map((line, i) => `${i + 1}: ${line}`).join('\n');
-    }
-
-    private async handleDebug(payload: { steps: DebugStep[] }): Promise<string[]> {
-        const results: string[] = [];
-
-        for (const step of payload.steps) {
-            switch (step.type) {
-                case 'setBreakpoint': {
-                    if (!step.line) {
-                        throw new Error('Line number required');
-                    }
-                    if (!step.file) {
-                        throw new Error('File path required');
-                    }
-
-                    // Open the file and make it active
-                    const document = await vscode.workspace.openTextDocument(step.file);
-                    const editor = await vscode.window.showTextDocument(document);
-
-                    const bp = new vscode.SourceBreakpoint(
-                        new vscode.Location(
-                            editor.document.uri,
-                            new vscode.Position(step.line - 1, 0)
-                        ),
-                        true,
-                        step.condition,
-                    );
-                    await vscode.debug.addBreakpoints([bp]);
-                    results.push(`Set breakpoint at line ${step.line}`);
-                    break;
-                }
-
-                case 'removeBreakpoint': {
-                    if (!step.line) {
-                        throw new Error('Line number required');
-                    }
-                    const bps = vscode.debug.breakpoints.filter(bp => {
-                        if (bp instanceof vscode.SourceBreakpoint) {
-                            return bp.location.range.start.line === step.line! - 1;
-                        }
-                        return false;
-                    });
-                    await vscode.debug.removeBreakpoints(bps);
-                    results.push(`Removed breakpoint at line ${step.line}`);
-                    break;
-                }
-
-                case 'continue': {
-                    const session = vscode.debug.activeDebugSession;
-                    if (!session) {
-                        throw new Error('No active debug session');
-                    }
-                    await session.customRequest('continue');
-                    results.push('Continued execution');
-                    break;
-                }
-
-                case 'evaluate': {
-                    const session = vscode.debug.activeDebugSession;
-                    if (!session) {
-                        throw new Error('No active debug session');
-                    }
-
-                    const activeStackItem = vscode.debug.activeStackItem;
-
-                    // Grab the active frameId
-                    let frameId = undefined;
-                    if (activeStackItem instanceof vscode.DebugStackFrame) {
-                        frameId = activeStackItem.frameId;
-                    }
-
-                    // In case activeStackItem.frameId is falsey
-                    if (!frameId) {
-                        // Get the current stack frame
-                        const frames = await session.customRequest('stackTrace', {
-                            threadId: 1  // You might need to get the actual threadId
-                        });
-
-                        if (!frames || !frames.stackFrames || frames.stackFrames.length === 0) {
-                            vscode.window.showErrorMessage('No stack frame available');
-                            break;
-                        }
-
-                        frameId = frames.stackFrames[0].id;  // Usually use the top frame
-                    }
-
-                    try {
-                        const response = await session.customRequest('evaluate', {
-                            expression: step.expression,
-                            frameId: frameId,
-                            context: 'repl'
-                        });
-
-                        results.push(`Evaluated "${step.expression}": ${response.result}`);
-                    } catch (err: any) {
-                        let errorMessage = '';
-                        let stackTrace = '';
-
-                        if (err instanceof Error) {
-                            errorMessage = err.message;
-                            if (err.stack) {
-                                stackTrace = `\nStack: ${err.stack}`;
-                            }
-                        } else {
-                            errorMessage = String(err);
-                        }
-                        results.push(`ERROR: Evaluation failed for "${step.expression}": ${errorMessage}${stackTrace}`);
-                    }
-                    break;
-                }
-
-                case 'launch': {
-                    if (step.file) {
-                        await this.handleLaunch({ program: step.file });
-                    }
-                }
-            }
-        }
-
-        return results;
     }
 
     private async executeDebugPlan(payload: { steps: DebugStep[] }): Promise<DebugExecutionEnvelope> {
@@ -865,7 +745,23 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 }
                 const launchResult = await this.handleLaunch({ program: step.file! });
                 result.messages!.push(launchResult);
-                // TODO: Parse launch result to extract initial state info
+                
+                // Parse launch result to extract initial state info
+                if (launchResult.includes('Stopped at breakpoint on line')) {
+                    const lineMatch = launchResult.match(/line (\d+)/);
+                    if (lineMatch) {
+                        result.output = {
+                            initialState: 'stopped_at_breakpoint',
+                            line: parseInt(lineMatch[1]),
+                            file: step.file
+                        };
+                    }
+                } else if (launchResult.includes('Debug session started')) {
+                    result.output = {
+                        initialState: 'running',
+                        file: step.file
+                    };
+                }
                 break;
             }
 
