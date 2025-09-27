@@ -23,7 +23,6 @@ function getPortFromConfig(): number {
         }
         
         const configPath = path.join(storagePath, 'port-config.json');
-        
         if (fs.existsSync(configPath)) {
             const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
             if (config && typeof config.port === 'number') {
@@ -90,31 +89,12 @@ const server = new Server(
 
 const debugDescription = `Execute a debug plan with breakpoints, launch, continues, and expression 
 evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where 
-you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files. 
-Only use continue when ready to move to the next breakpoint. Launch will bring you to the first 
-breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
+you are in your execution path and what is currently available to see the state. 
+If you set a breakpoint but didn't hit it, check the stacktrace on the exception to see what you've missed, what line you're on etc.
+If you can't debug directly, set breakpoints, launch, see what happens, and build up your understanding from there.`;
 
-const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
-
-const getFileContentDescription = `Get file content with line numbers - you likely need to list files 
-to understand what files are available. Be careful to use absolute paths.`;
-
-// Zod schemas for the tools
-const listFilesInputSchema = {
-    type: "object",
-    properties: {
-        includePatterns: {
-            type: "array",
-            items: { type: "string" },
-            description: "Glob patterns to include (e.g. ['**/*.js'])"
-        },
-        excludePatterns: {
-            type: "array",
-            items: { type: "string" },
-            description: "Glob patterns to exclude (e.g. ['node_modules/**'])"
-        }
-    }
-};
+const listFilesDescription = "List all files in a directory. Use to explore a project's structure. Returns file paths.";
+const getFileContentDescription = "Get the content of a specific file. Use to read source code, configuration files, etc.";
 
 const getFileContentInputSchema = {
     type: "object",
@@ -186,19 +166,31 @@ const debugInputSchema = {
 const tools = [
     {
         name: "listFiles",
-        description: listFilesDescription, // Make sure this variable is defined in your code
-        inputSchema: listFilesInputSchema,
+        description: listFilesDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: {
+                    type: "string",
+                    description: "Directory path to list files from. If not provided, lists current directory."
+                },
+                maxDepth: {
+                    type: "number", 
+                    description: "Maximum depth to recurse into subdirectories. Default is 3."
+                }
+            }
+        }
     },
     {
         name: "getFileContent",
-        description: getFileContentDescription, // Make sure this variable is defined in your code
-        inputSchema: getFileContentInputSchema,
+        description: getFileContentDescription,
+        inputSchema: getFileContentInputSchema
     },
     {
         name: "debug",
-        description: debugDescription, // Make sure this variable is defined in your code
-        inputSchema: debugInputSchema,
-    },
+        description: debugDescription,
+        inputSchema: debugInputSchema
+    }
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -206,19 +198,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const response = await makeRequest({
-        type: 'callTool',
-        tool: request.params.name,
-        arguments: request.params.arguments
-    });
-
-    return {
-        content: [{
-            type: "text",
-            text: Array.isArray(response) ? response.join("\n") : response
-        }]
-    };
+    try {
+        const result = await makeRequest({
+            method: request.params.name,
+            params: request.params.arguments
+        });
+        
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+                }
+            ]
+        };
+    } catch (error: any) {
+        return {
+            content: [
+                {
+                    type: "text", 
+                    text: `Error: ${error.message}`
+                }
+            ]
+        };
+    }
 });
+
+async function main(): Promise<boolean> {
+    try {
+        const transport = new StdioServerTransport();
+        await server.connect(transport);
+        console.error("MCP Debug Server running");
+        return true;
+    } catch (error: any) {
+        console.error("Error starting MCP server:", error);
+        return false;
+    }
+}
 
 function sleep(ms: number) {
     return new Promise((resolve) => {
@@ -226,19 +242,6 @@ function sleep(ms: number) {
     });
 }
 
-async function main() {
-    try {
-        const transport = new StdioServerTransport();
-        await server.connect(transport);
-        console.error("MCP Debug Server running");
-        return true;
-    } catch (error) {
-        console.error("Error starting server:", error);
-        return false;
-    }
-}
-
-// Only try up to 10 times
 const MAX_RETRIES = 10;
 
 // Wait 500ms before each subsequent check
@@ -258,4 +261,3 @@ const INITIAL_DELAY = 500;
         await sleep(TIMEOUT);
     }
 })();
-
