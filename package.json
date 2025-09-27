@@ -89,7 +89,8 @@
     "test": "vscode-test"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.4.1"
+    "@modelcontextprotocol/sdk": "^1.4.1",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

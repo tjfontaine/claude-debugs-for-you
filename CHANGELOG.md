@@ -11,12 +11,20 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - Native VS Code MCP server registration using `vscode.lm.registerMcpServerDefinitionProvider` API
 - Automatic MCP server definitions for both stdio and HTTP/SSE transports
 - MCP server automatically starts when VS Code language model tries to connect
+- **Enhanced MCP Server Functionality**: Aligned mcp-server with debug-server capabilities
+  - Added Zod schema validation for all tools (matching debug-server)
+  - Added granular debug tools: `debug.status`, `debug.evaluate`, `debug.listBreakpoints`, `debug.getLogs`
+  - Added MCP resources: `debug-session`, `debug-breakpoints`, `debug-events`
+  - Added MCP prompts: `debug-strategy`, `debug-evaluation` for debugging assistance
+  - Enhanced tool descriptions and input validation
 
 ### Changed
 - Unified build system: removed separate `mcp/` subdirectory and consolidated into single package.json with esbuild
 - MCP server is now built as part of main extension build process
 - Simplified project structure following VS Code MCP extension guidelines
 - Updated to VS Code engine 1.104.0 for MCP server registration API support
+- **MCP Server Enhancement**: Upgraded from basic JSON schemas to advanced Zod schemas
+- Added zod dependency for enhanced schema validation
 
 ## 0.1.1
 
