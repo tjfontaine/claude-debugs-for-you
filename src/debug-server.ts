@@ -1,6 +1,7 @@
 import * as net from 'net';
 import * as http from 'http';
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { z } from 'zod';
 
@@ -20,10 +21,48 @@ export interface DebugCommand {
 
 export interface DebugStep {
     type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch';
-    file: string;
+    file?: string;
     line?: number;
     expression?: string;
     condition?: string;
+    timeoutMs?: number;
+}
+
+// New structured response types
+export interface DebugStepResult {
+    index: number;
+    type: string;
+    status: 'ok' | 'error' | 'skipped' | 'timeout';
+    messages?: string[];
+    error?: {
+        message: string;
+        stack?: string;
+        dapCommand?: string;
+        dapArgs?: any;
+        category?: 'validation' | 'dap_protocol' | 'fatal_launch' | 'internal';
+    };
+    timing: { started: string; ended?: string; durationMs?: number };
+    output?: any;
+}
+
+export interface DebugEvent {
+    event: string;
+    body?: any;
+    sessionId?: string;
+    timestamp: string;
+}
+
+export interface DebugExecutionEnvelope {
+    version: 1;
+    sessionId: string;
+    steps: DebugStepResult[];
+    events: DebugEvent[];
+    summary: {
+        overallStatus: 'ok' | 'partial' | 'failed';
+        successCount: number;
+        errorCount: number;
+        skippedCount: number;
+    };
 }
 
 interface ToolRequest {
@@ -37,6 +76,37 @@ evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to
 you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files. 
 Only use continue when ready to move to the next breakpoint. Launch will bring you to the first 
 breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
+
+// Utility functions for enhanced debug server
+function nowIso(): string {
+    return new Date().toISOString();
+}
+
+async function safeDAP<T>(
+    session: vscode.DebugSession,
+    command: string,
+    args: any
+): Promise<{ result?: T; error?: { message: string; stack?: string; category: 'validation' | 'dap_protocol' | 'fatal_launch' | 'internal' } }> {
+    try {
+        const result = await session.customRequest(command, args);
+        return { result };
+    } catch (e: any) {
+        return {
+            error: {
+                message: e?.message || String(e),
+                stack: e?.stack,
+                category: 'dap_protocol' as const
+            }
+        };
+    }
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
+        promise.then(v => { clearTimeout(timeout); resolve(v); }, e => { clearTimeout(timeout); reject(e); });
+    });
+}
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
@@ -55,10 +125,28 @@ const getFileContentInputSchema = {
 
 const debugStepSchema = z.object({
     type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch"]).describe(""),
-    file: z.string(),
+    file: z.string().optional(),
     line: z.number().optional(),
     expression: z.string().describe("An expression to be evaluated in the stack frame of the current breakpoint").optional(),
     condition: z.string().describe("If needed, a breakpoint condition may be specified to only stop on a breakpoint for some given condition.").optional(),
+    timeoutMs: z.number().describe("Optional timeout in milliseconds for this step").optional(),
+}).refine((data) => {
+    // Validation rules based on step type
+    if (data.type === 'setBreakpoint') {
+        return data.file && data.line !== undefined;
+    }
+    if (data.type === 'removeBreakpoint') {
+        return data.line !== undefined;
+    }
+    if (data.type === 'evaluate') {
+        return data.expression;
+    }
+    if (data.type === 'launch') {
+        return data.file;
+    }
+    return true; // continue doesn't need additional fields
+}, {
+    message: "Missing required fields for step type"
 });
 
 const debugInputSchema = {
@@ -90,6 +178,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private activeTransports: Record<string, SSEServerTransport> = {};
     private mcpServer: McpServer;
     private _isRunning: boolean = false;
+    private bufferedEvents: DebugEvent[] = [];
+    private eventDisposables: vscode.Disposable[] = [];
 
     constructor(port?: number, portConfigPath?: string) {
         super();
@@ -112,8 +202,24 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         });
 
         this.mcpServer.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
-            const results = await this.handleDebug(args);
-            return { content: [{ type: "text", text: results.join('\n') }] };
+            const envelope = await this.executeDebugPlan(args);
+            return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
+        });
+
+        // Additional granular debug tools
+        this.mcpServer.tool("debug.status", "Get current debug session status and thread information", {}, async () => {
+            return { content: [{ type: "text", text: JSON.stringify(await this.getDebugStatus(), null, 2) }] };
+        });
+
+        this.mcpServer.tool("debug.evaluate", "Evaluate a single expression in the current debug context", {
+            expression: z.string().describe("The expression to evaluate")
+        }, async (args: any) => {
+            const result = await this.evaluateExpression(args.expression);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        this.mcpServer.tool("debug.listBreakpoints", "List all current breakpoints", {}, async () => {
+            return { content: [{ type: "text", text: JSON.stringify(await this.listBreakpoints(), null, 2) }] };
         });
     }
 
@@ -521,7 +627,9 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 }
 
                 case 'launch': {
-                    await this.handleLaunch({ program: step.file });
+                    if (step.file) {
+                        await this.handleLaunch({ program: step.file });
+                    }
                 }
             }
         }
@@ -529,8 +637,399 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         return results;
     }
 
+    private async executeDebugPlan(payload: { steps: DebugStep[] }): Promise<DebugExecutionEnvelope> {
+        const steps = payload.steps || [];
+        const sessionId = crypto.randomUUID();
+        const results: DebugStepResult[] = [];
+        const bufferedEvents: DebugEvent[] = [];
+
+        // Subscribe to debug events
+        const disposables: vscode.Disposable[] = [];
+
+        disposables.push(
+            vscode.debug.onDidReceiveDebugSessionCustomEvent(evt => {
+                bufferedEvents.push({
+                    event: 'debug.custom',
+                    body: evt.body,
+                    sessionId: evt.session.id,
+                    timestamp: nowIso()
+                });
+            }),
+            vscode.debug.onDidTerminateDebugSession(s => {
+                bufferedEvents.push({ 
+                    event: 'debug.terminated', 
+                    sessionId: s.id, 
+                    timestamp: nowIso() 
+                });
+            }),
+            vscode.debug.onDidStartDebugSession(s => {
+                bufferedEvents.push({ 
+                    event: 'debug.started', 
+                    sessionId: s.id, 
+                    timestamp: nowIso() 
+                });
+            })
+        );
+
+        let fatal = false;
+
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const timingStart = Date.now();
+            const result: DebugStepResult = {
+                index: i,
+                type: step.type,
+                status: 'ok',
+                timing: { started: nowIso() },
+                messages: []
+            };
+
+            if (fatal) {
+                result.status = 'skipped';
+                result.messages!.push('Skipped due to previous fatal error');
+                results.push(result);
+                continue;
+            }
+
+            try {
+                // Apply timeout if specified
+                const stepPromise = this.executeStep(step, result);
+                const timeoutMs = step.timeoutMs || 30000; // Default 30s timeout
+                
+                await withTimeout(stepPromise, timeoutMs);
+
+            } catch (e: any) {
+                if (e.message.includes('Timeout after')) {
+                    result.status = 'timeout';
+                    result.error = { 
+                        message: e.message, 
+                        category: 'internal' 
+                    };
+                } else {
+                    result.status = 'error';
+                    result.error = { 
+                        message: e?.message || String(e), 
+                        stack: e?.stack,
+                        category: this.classifyError(e, step.type)
+                    };
+                    
+                    // Mark as fatal if it's a launch failure
+                    if (step.type === 'launch') {
+                        fatal = true;
+                    }
+                }
+            } finally {
+                result.timing.ended = nowIso();
+                result.timing.durationMs = Date.now() - timingStart;
+                results.push(result);
+            }
+        }
+
+        disposables.forEach(d => d.dispose());
+
+        const errorCount = results.filter(r => r.status === 'error').length;
+        const skippedCount = results.filter(r => r.status === 'skipped').length;
+        const successCount = results.filter(r => r.status === 'ok').length;
+        
+        const overallStatus =
+            errorCount === 0 && skippedCount === 0 ? 'ok' :
+            errorCount === results.length ? 'failed' : 'partial';
+
+        return {
+            version: 1,
+            sessionId,
+            steps: results,
+            events: bufferedEvents,
+            summary: {
+                overallStatus,
+                successCount,
+                errorCount,
+                skippedCount
+            }
+        };
+    }
+
+    private async executeStep(step: DebugStep, result: DebugStepResult): Promise<void> {
+        switch (step.type) {
+            case 'setBreakpoint': {
+                if (!step.line) {
+                    throw new Error('Line number required for setBreakpoint');
+                }
+                if (!step.file) {
+                    throw new Error('File path required for setBreakpoint');
+                }
+
+                // Open the file and make it active
+                const document = await vscode.workspace.openTextDocument(step.file);
+                const editor = await vscode.window.showTextDocument(document);
+
+                const bp = new vscode.SourceBreakpoint(
+                    new vscode.Location(
+                        editor.document.uri,
+                        new vscode.Position(step.line - 1, 0)
+                    ),
+                    true,
+                    step.condition,
+                );
+                await vscode.debug.addBreakpoints([bp]);
+                result.messages!.push(`Set breakpoint at ${step.file}:${step.line}${step.condition ? ` (condition: ${step.condition})` : ''}`);
+                break;
+            }
+
+            case 'removeBreakpoint': {
+                if (!step.line) {
+                    throw new Error('Line number required for removeBreakpoint');
+                }
+                const bps = vscode.debug.breakpoints.filter(bp => {
+                    if (bp instanceof vscode.SourceBreakpoint) {
+                        return bp.location.range.start.line === step.line! - 1;
+                    }
+                    return false;
+                });
+                await vscode.debug.removeBreakpoints(bps);
+                result.messages!.push(`Removed ${bps.length} breakpoint(s) at line ${step.line}`);
+                break;
+            }
+
+            case 'continue': {
+                const session = vscode.debug.activeDebugSession;
+                if (!session) {
+                    throw new Error('No active debug session');
+                }
+                const { result: continueResult, error } = await safeDAP(session, 'continue', {});
+                if (error) {
+                    result.error = {
+                        message: error.message,
+                        stack: error.stack,
+                        dapCommand: 'continue',
+                        category: error.category
+                    };
+                    result.status = 'error';
+                } else {
+                    result.messages!.push('Continued execution');
+                }
+                break;
+            }
+
+            case 'evaluate': {
+                if (!step.expression) {
+                    throw new Error('Expression required for evaluate');
+                }
+                
+                const session = vscode.debug.activeDebugSession;
+                if (!session) {
+                    throw new Error('No active debug session');
+                }
+
+                const activeStackItem = vscode.debug.activeStackItem;
+                let frameId = undefined;
+                
+                if (activeStackItem instanceof vscode.DebugStackFrame) {
+                    frameId = activeStackItem.frameId;
+                }
+
+                // Get frame ID if not available
+                if (!frameId) {
+                    const { result: stackResult, error: stackError } = await safeDAP<any>(session, 'stackTrace', { threadId: 1 });
+                    if (stackError || !stackResult?.stackFrames?.length) {
+                        throw new Error('No stack frame available for evaluation');
+                    }
+                    frameId = stackResult.stackFrames[0].id;
+                }
+
+                const { result: evalResult, error } = await safeDAP<any>(session, 'evaluate', {
+                    expression: step.expression,
+                    frameId,
+                    context: 'repl'
+                });
+
+                if (error) {
+                    result.status = 'error';
+                    result.error = {
+                        message: error.message,
+                        stack: error.stack,
+                        dapCommand: 'evaluate',
+                        dapArgs: { expression: step.expression, frameId },
+                        category: error.category
+                    };
+                } else {
+                    result.output = evalResult;
+                    result.messages!.push(`Evaluated "${step.expression}": ${evalResult.result}`);
+                }
+                break;
+            }
+
+            case 'launch': {
+                if (!step.file) {
+                    throw new Error('File path required for launch');
+                }
+                const launchResult = await this.handleLaunch({ program: step.file! });
+                result.messages!.push(launchResult);
+                // TODO: Parse launch result to extract initial state info
+                break;
+            }
+
+            default:
+                throw new Error(`Unsupported step type: ${step.type}`);
+        }
+    }
+
+    private classifyError(error: any, stepType: string): 'validation' | 'dap_protocol' | 'fatal_launch' | 'internal' {
+        const message = error?.message || String(error);
+        
+        if (message.includes('required')) {
+            return 'validation';
+        }
+        if (stepType === 'launch') {
+            return 'fatal_launch';
+        }
+        if (message.includes('debug session') || message.includes('DAP') || message.includes('customRequest')) {
+            return 'dap_protocol';
+        }
+        return 'internal';
+    }
+
+    private async getDebugStatus(): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            return { 
+                version: 1,
+                status: 'no_active_session',
+                timestamp: nowIso()
+            };
+        }
+
+        try {
+            const { result: threads } = await safeDAP<any>(session, 'threads', {});
+            const activeStackItem = vscode.debug.activeStackItem;
+            
+            return {
+                version: 1,
+                status: 'active',
+                sessionId: session.id,
+                sessionName: session.name,
+                threads: threads?.threads || [],
+                activeStackFrame: activeStackItem instanceof vscode.DebugStackFrame ? {
+                    frameId: activeStackItem.frameId
+                } : null,
+                timestamp: nowIso()
+            };
+        } catch (error) {
+            return {
+                version: 1,
+                status: 'error',
+                error: String(error),
+                timestamp: nowIso()
+            };
+        }
+    }
+
+    private async evaluateExpression(expression: string): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            return {
+                version: 1,
+                status: 'error',
+                error: 'No active debug session',
+                timestamp: nowIso()
+            };
+        }
+
+        try {
+            const activeStackItem = vscode.debug.activeStackItem;
+            let frameId = undefined;
+            
+            if (activeStackItem instanceof vscode.DebugStackFrame) {
+                frameId = activeStackItem.frameId;
+            }
+
+            if (!frameId) {
+                const { result: stackResult, error: stackError } = await safeDAP<any>(session, 'stackTrace', { threadId: 1 });
+                if (stackError || !stackResult?.stackFrames?.length) {
+                    return {
+                        version: 1,
+                        status: 'error',
+                        error: 'No stack frame available for evaluation',
+                        timestamp: nowIso()
+                    };
+                }
+                frameId = stackResult.stackFrames[0].id;
+            }
+
+            const { result: evalResult, error } = await safeDAP<any>(session, 'evaluate', {
+                expression,
+                frameId,
+                context: 'repl'
+            });
+
+            if (error) {
+                return {
+                    version: 1,
+                    status: 'error',
+                    error: error.message,
+                    expression,
+                    timestamp: nowIso()
+                };
+            }
+
+            return {
+                version: 1,
+                status: 'ok',
+                expression,
+                result: evalResult,
+                timestamp: nowIso()
+            };
+        } catch (error) {
+            return {
+                version: 1,
+                status: 'error',
+                error: String(error),
+                expression,
+                timestamp: nowIso()
+            };
+        }
+    }
+
+    private async listBreakpoints(): Promise<any> {
+        const breakpoints = vscode.debug.breakpoints;
+        const formattedBreakpoints = breakpoints.map(bp => {
+            if (bp instanceof vscode.SourceBreakpoint) {
+                return {
+                    type: 'source',
+                    file: bp.location.uri.fsPath,
+                    line: bp.location.range.start.line + 1, // Convert to 1-based
+                    condition: bp.condition,
+                    enabled: bp.enabled
+                };
+            } else if (bp instanceof vscode.FunctionBreakpoint) {
+                return {
+                    type: 'function',
+                    functionName: bp.functionName,
+                    condition: bp.condition,
+                    enabled: bp.enabled
+                };
+            } else {
+                return {
+                    type: 'other',
+                    enabled: bp.enabled
+                };
+            }
+        });
+
+        return {
+            version: 1,
+            breakpoints: formattedBreakpoints,
+            count: formattedBreakpoints.length,
+            timestamp: nowIso()
+        };
+    }
+
     stop(): Promise<void> {
         return new Promise((resolve) => {
+            // Dispose of any active event listeners
+            this.eventDisposables.forEach(d => d.dispose());
+            this.eventDisposables = [];
+            
             if (!this.server) {
                 this._isRunning = false;
                 this.emit('stopped');
