@@ -5,6 +5,13 @@ All notable changes to the "claude-debugs-for-you" extension will be documented 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
 
+## Unreleased
+
+### Changed
+- Unified build system: removed separate `mcp/` subdirectory and consolidated into single package.json with esbuild
+- MCP server is now built as part of main extension build process
+- Simplified project structure following VS Code MCP extension guidelines
+
 ## 0.1.1
 
 - Fixes issue with Claude Desktop not detecting tools
