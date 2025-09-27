@@ -32,6 +32,52 @@ export function activate(context: vscode.ExtensionContext) {
 
     const server = new DebugServer(port, portConfigPath);
 
+    // Register MCP Server Definition Provider
+    const didChangeEmitter = new vscode.EventEmitter<void>();
+    
+    context.subscriptions.push(vscode.lm.registerMcpServerDefinitionProvider('claude-debugs-for-you', {
+        onDidChangeMcpServerDefinitions: didChangeEmitter.event,
+        provideMcpServerDefinitions: async () => {
+            const servers: vscode.McpServerDefinition[] = [];
+            
+            // Get current port configuration
+            const currentConfig = vscode.workspace.getConfiguration('mcpDebug');
+            const currentPort = currentConfig.get<number>('port') ?? 4711;
+            
+            // Add stdio server definition for the MCP debug server
+            servers.push(new vscode.McpStdioServerDefinition(
+                'Claude Debugs For You',
+                'node',
+                [mcpServerPath],
+                undefined, // env
+                '1.0.0'
+            ));
+            
+            // Also add HTTP server definition for SSE transport
+            servers.push(new vscode.McpHttpServerDefinition(
+                'Claude Debugs For You (HTTP)',
+                vscode.Uri.parse(`http://localhost:${currentPort}/sse`),
+                undefined, // headers
+                '1.0.0'
+            ));
+            
+            return servers;
+        },
+        resolveMcpServerDefinition: async (serverDefinition: vscode.McpServerDefinition) => {
+            // Ensure the debug server is running before MCP clients try to connect
+            if (!server.isRunning) {
+                try {
+                    await server.start();
+                } catch (err: any) {
+                    vscode.window.showErrorMessage(`Failed to start debug server for MCP: ${err.message}`);
+                    throw new Error(`Debug server failed to start: ${err.message}`);
+                }
+            }
+            
+            return serverDefinition;
+        }
+    }));
+
     // Create status bar item
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right);
     statusBarItem.command = 'claude-debugs-for-you.showCommands';
@@ -70,6 +116,9 @@ export function activate(context: vscode.ExtensionContext) {
 
                 // Update server's port setting
                 server.setPort(newPort);
+                
+                // Notify MCP server definitions changed
+                didChangeEmitter.fire();
 
                 if (server.isRunning) {
                     // Port changed, restart server with new port
