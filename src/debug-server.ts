@@ -180,6 +180,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private _isRunning: boolean = false;
     private bufferedEvents: DebugEvent[] = [];
     private eventDisposables: vscode.Disposable[] = [];
+    private logBuffer: Array<{level: string, message: string, timestamp: string, data?: any}> = [];
 
     constructor(port?: number, portConfigPath?: string) {
         super();
@@ -188,6 +189,54 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         this.mcpServer = new McpServer({
             name: "Debug Server",
             version: "1.0.0",
+        }, {
+            capabilities: {
+                logging: {},
+                resources: {
+                    subscribe: true,
+                    listChanged: true
+                },
+                prompts: {
+                    listChanged: true
+                }
+            }
+        });
+
+        // Setup MCP resources for debug state information
+        this.mcpServer.resource("debug-session", "debug://session/current", async () => {
+            const status = await this.getDebugStatus();
+            return {
+                contents: [{
+                    uri: "debug://session/current",
+                    text: JSON.stringify(status, null, 2),
+                    mimeType: "application/json"
+                }]
+            };
+        });
+
+        this.mcpServer.resource("debug-breakpoints", "debug://breakpoints/all", async () => {
+            const breakpoints = await this.listBreakpoints();
+            return {
+                contents: [{
+                    uri: "debug://breakpoints/all",
+                    text: JSON.stringify(breakpoints, null, 2),
+                    mimeType: "application/json"
+                }]
+            };
+        });
+
+        this.mcpServer.resource("debug-events", "debug://events/recent", async () => {
+            return {
+                contents: [{
+                    uri: "debug://events/recent",
+                    text: JSON.stringify({
+                        version: 1,
+                        events: this.bufferedEvents.slice(-50), // Last 50 events
+                        timestamp: nowIso()
+                    }, null, 2),
+                    mimeType: "application/json"
+                }]
+            };
         });
 
         // Setup MCP tools to use our existing handlers
@@ -201,8 +250,9 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             return { content: [{ type: "text", text: content }] };
         });
 
-        this.mcpServer.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
-            const envelope = await this.executeDebugPlan(args);
+        this.mcpServer.tool("debug", debugDescription, debugInputSchema, async (args: any, extra?: any) => {
+            const progressToken = extra?.progressToken;
+            const envelope = await this.executeDebugPlan(args, progressToken);
             return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
         });
 
@@ -221,6 +271,114 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         this.mcpServer.tool("debug.listBreakpoints", "List all current breakpoints", {}, async () => {
             return { content: [{ type: "text", text: JSON.stringify(await this.listBreakpoints(), null, 2) }] };
         });
+
+        this.mcpServer.tool("debug.getLogs", "Get recent debug server logs", {
+            level: z.enum(['debug', 'info', 'notice', 'warning', 'error', 'critical']).optional().describe("Filter by log level"),
+            limit: z.number().optional().describe("Maximum number of log entries to return (default: 100)")
+        }, async (args) => {
+            const level = args.level;
+            const limit = args.limit || 100;
+            
+            let logs = this.logBuffer.slice(-limit);
+            if (level) {
+                logs = logs.filter(log => log.level === level);
+            }
+            
+            return { content: [{ type: "text", text: JSON.stringify({
+                version: 1,
+                logs,
+                totalInBuffer: this.logBuffer.length,
+                timestamp: nowIso()
+            }, null, 2) }] };
+        });
+
+        // Setup MCP prompts for debugging assistance
+        this.mcpServer.prompt("debug-strategy", "Generate a debugging strategy based on current state", {
+            error: z.string().describe("Error message or description of the problem"),
+            language: z.string().optional().describe("Programming language (e.g., javascript, python)")
+        }, async (args) => {
+            const currentSession = await this.getDebugStatus();
+            const breakpoints = await this.listBreakpoints();
+            
+            const context = `
+Current Debug State:
+- Session: ${JSON.stringify(currentSession, null, 2)}
+- Breakpoints: ${JSON.stringify(breakpoints, null, 2)}
+- Error: ${args.error}
+- Language: ${args.language || 'unknown'}
+            `.trim();
+
+            return {
+                description: "Debugging strategy based on current state",
+                messages: [{
+                    role: "user",
+                    content: {
+                        type: "text",
+                        text: `Given the current debug state and error, help me create an effective debugging plan:
+
+${context}
+
+Please suggest specific debug steps using the available debug tools (setBreakpoint, evaluate, continue, launch) that would help investigate this error.`
+                    }
+                }]
+            };
+        });
+
+        this.mcpServer.prompt("debug-evaluation", "Generate expressions to evaluate at current breakpoint", {
+            context: z.string().describe("Context about what you're trying to debug"),
+            variables: z.string().optional().describe("Comma-separated variable names to inspect")
+        }, async (args) => {
+            const currentSession = await this.getDebugStatus();
+            
+            const context = `
+Current Debug Context:
+- Session Status: ${currentSession.status}
+- Variables to inspect: ${args.variables || 'none specified'}
+- Context: ${args.context}
+            `.trim();
+
+            return {
+                description: "Suggested expressions for debugging",
+                messages: [{
+                    role: "user",
+                    content: {
+                        type: "text",
+                        text: `Based on the current debug context, suggest specific expressions I should evaluate to understand the problem:
+
+${context}
+
+Provide expressions that would help debug the issue, including variable inspections, function calls, and state checks.`
+                    }
+                }]
+            };
+        });
+    }
+
+    // Enhanced logging with MCP integration
+    private async log(level: 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical', message: string, data?: any): Promise<void> {
+        const logEntry = {
+            level,
+            message,
+            timestamp: nowIso(),
+            data
+        };
+        
+        // Store in local buffer
+        this.logBuffer.push(logEntry);
+        if (this.logBuffer.length > 1000) {
+            this.logBuffer = this.logBuffer.slice(-1000); // Keep last 1000 entries
+        }
+
+        // Send to MCP client if connected
+        try {
+            await this.mcpServer.server.sendLoggingMessage({
+                level: level as any,
+                data: data ? `${message}\n${JSON.stringify(data, null, 2)}` : message,
+                logger: 'debug-server'
+            });
+        } catch (error) {
+            // Silently fail if logging isn't supported by client
+        }
     }
 
     get isRunning(): boolean {
@@ -517,11 +675,23 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         return lines.map((line, i) => `${i + 1}: ${line}`).join('\n');
     }
 
-    private async executeDebugPlan(payload: { steps: DebugStep[] }): Promise<DebugExecutionEnvelope> {
+    private async executeDebugPlan(payload: { steps: DebugStep[] }, progressToken?: string): Promise<DebugExecutionEnvelope> {
         const steps = payload.steps || [];
         const sessionId = crypto.randomUUID();
         const results: DebugStepResult[] = [];
         const bufferedEvents: DebugEvent[] = [];
+
+        await this.log('info', 'Starting debug plan execution', { sessionId, stepCount: steps.length });
+
+        // Send initial progress notification if token provided
+        if (progressToken) {
+            try {
+                // Note: Progress notifications may not be available in current SDK version
+                console.log(`Progress: 0/${steps.length} steps completed`);
+            } catch (error) {
+                // Ignore if progress not supported
+            }
+        }
 
         // Subscribe to debug events
         const disposables: vscode.Disposable[] = [];
@@ -564,10 +734,13 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 messages: []
             };
 
+            await this.log('debug', `Executing step ${i + 1}/${steps.length}: ${step.type}`, step);
+
             if (fatal) {
                 result.status = 'skipped';
                 result.messages!.push('Skipped due to previous fatal error');
                 results.push(result);
+                await this.log('warning', `Skipping step ${i + 1} due to fatal error`, { step: step.type });
                 continue;
             }
 
@@ -577,6 +750,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 const timeoutMs = step.timeoutMs || 30000; // Default 30s timeout
                 
                 await withTimeout(stepPromise, timeoutMs);
+                await this.log('debug', `Step ${i + 1} completed successfully`, { step: step.type, status: result.status });
 
             } catch (e: any) {
                 if (e.message.includes('Timeout after')) {
@@ -585,6 +759,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         message: e.message, 
                         category: 'internal' 
                     };
+                    await this.log('warning', `Step ${i + 1} timed out`, { step: step.type, timeout: step.timeoutMs || 30000 });
                 } else {
                     result.status = 'error';
                     result.error = { 
@@ -593,15 +768,27 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         category: this.classifyError(e, step.type)
                     };
                     
+                    await this.log('error', `Step ${i + 1} failed`, { step: step.type, error: result.error });
+                    
                     // Mark as fatal if it's a launch failure
                     if (step.type === 'launch') {
                         fatal = true;
+                        await this.log('critical', 'Fatal launch error - subsequent steps will be skipped', { step: step.type });
                     }
                 }
             } finally {
                 result.timing.ended = nowIso();
                 result.timing.durationMs = Date.now() - timingStart;
                 results.push(result);
+
+                // Send progress update if token provided
+                if (progressToken) {
+                    try {
+                        console.log(`Progress: ${i + 1}/${steps.length} steps completed`);
+                    } catch (error) {
+                        // Ignore if progress not supported
+                    }
+                }
             }
         }
 
@@ -615,8 +802,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             errorCount === 0 && skippedCount === 0 ? 'ok' :
             errorCount === results.length ? 'failed' : 'partial';
 
-        return {
-            version: 1,
+        const finalSummary: DebugExecutionEnvelope = {
+            version: 1 as const,
             sessionId,
             steps: results,
             events: bufferedEvents,
@@ -627,6 +814,14 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 skippedCount
             }
         };
+
+        await this.log('info', 'Debug plan execution completed', {
+            sessionId,
+            summary: finalSummary.summary,
+            duration: Date.now() - Date.parse(results[0]?.timing.started || nowIso())
+        });
+
+        return finalSummary;
     }
 
     private async executeStep(step: DebugStep, result: DebugStepResult): Promise<void> {
