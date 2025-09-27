@@ -75,7 +75,8 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "cd mcp && npm run build && cd - && tsc -p ./",
+    "compile": "npm run build:mcp && tsc -p ./",
+    "build:mcp": "esbuild src/mcp-server.ts --bundle --platform=node --target=node20 --outfile=out/mcp-server.js --minify --sourcemap --format=cjs --banner:js='#!/usr/bin/env node' && chmod +x out/mcp-server.js",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
@@ -92,6 +93,7 @@
     "@typescript-eslint/parser": "^8.17.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.24.2",
     "eslint": "^9.16.0",
     "typescript": "^5.7.2"
   }
