@@ -147,8 +147,30 @@ const debugStepSchema = {
                 description: "If needed, a breakpoint condition may be specified to only stop on a breakpoint for some given condition.",
                 type: "string"
             },
+            timeoutMs: {
+                description: "Optional timeout in milliseconds for this step",
+                type: "number"
+            }
         },
-        required: ["type", "file"]
+        required: ["type"],
+        allOf: [
+            { 
+                if: { properties: { type: { const: "setBreakpoint" } } }, 
+                then: { required: ["file", "line"] } 
+            },
+            { 
+                if: { properties: { type: { const: "removeBreakpoint" } } }, 
+                then: { required: ["line"] } 
+            },
+            { 
+                if: { properties: { type: { const: "evaluate" } } }, 
+                then: { required: ["expression"] } 
+            },
+            { 
+                if: { properties: { type: { const: "launch" } } }, 
+                then: { required: ["file"] } 
+            }
+        ]
     }
 };
 
